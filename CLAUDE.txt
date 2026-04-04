@@ -1,0 +1,79 @@
+# CLAUDE.txt
+
+Este archivo provee orientación a Claude Code (claude.ai/code) al trabajar con el código de este repositorio.
+
+## Qué es este proyecto
+
+UIGen es un generador de componentes React con inteligencia artificial y preview en vivo. Los usuarios describen componentes en lenguaje natural, Claude los genera mediante tool calls que manipulan un sistema de archivos virtual, y un iframe con sandbox los renderiza en tiempo real.
+
+## Comandos
+
+```bash
+npm run dev          # Iniciar servidor de desarrollo (Turbopack)
+npm run test         # Ejecutar Vitest
+npm run lint         # ESLint (configuración Next.js)
+npm run build        # Build de producción
+npm run setup        # Setup desde cero: install + prisma generate + migrate
+npm run db:reset     # Resetear base de datos SQLite
+```
+
+Archivo de test individual:
+```bash
+npx vitest run src/lib/__tests__/file-system.test.ts
+```
+
+Entorno: configurar `ANTHROPIC_API_KEY` en `.env` para usar Claude real. Sin ella, se usa automáticamente un `MockLanguageModel`.
+
+## Arquitectura
+
+### Ciclo de vida de una solicitud
+
+1. El usuario escribe un prompt → `ChatInterface` lo envía a `POST /api/chat`
+2. La API transmite la respuesta de Claude usando `streamText` (Vercel AI SDK)
+3. Claude llama a las tools (`str_replace_editor`, `file_manager`) para crear/modificar archivos
+4. Las tool calls actualizan el **VirtualFileSystem** (en memoria, no en disco)
+5. `FileSystemContext` propaga los cambios → `PreviewFrame` se re-renderiza
+6. `JsxTransformer` (Babel standalone) compila JSX → import map + módulos ES → iframe con sandbox
+
+### VirtualFileSystem (`src/lib/file-system.ts`)
+
+La abstracción central. Contiene todos los archivos del proyecto en memoria. Métodos: `createFile`, `updateFile`, `deleteFile`, `rename`, `exists`, `serialize/deserialize`. Las tools de Claude operan exclusivamente a través de esta clase. Los datos del proyecto se persisten como `JSON.stringify(vfs.serialize())` en `Project.data` (Prisma).
+
+### Tools de IA (`src/lib/tools/`)
+
+- `str_replace_editor` — operaciones view, create, str_replace, insert sobre archivos virtuales
+- `file_manager` — operaciones rename y delete
+
+Ambas están tipadas con Zod y se pasan a `streamText`. El loop agéntico corre hasta 40 pasos (real) o 4 pasos (mock).
+
+### Sistema de Preview (`src/lib/transform/jsx-transformer.ts`)
+
+Transforma TSX/JSX a módulos ES usando Babel standalone. Construye un import map dinámico que apunta a `esm.sh` para paquetes externos y a los archivos virtuales transformados para imports locales. El iframe recibe un documento HTML completo con este import map inyectado. El punto de entrada siempre es `/App.jsx`.
+
+### Manejo de estado
+
+Dos contextos de React contienen todo el estado:
+- `FileSystemContext` (`src/lib/contexts/file-system-context.tsx`) — contiene la instancia del `VirtualFileSystem`
+- `ChatContext` (`src/lib/contexts/chat-context.tsx`) — contiene el historial de mensajes y el estado del streaming
+
+Ambos se proveen en `main-content.tsx`, que también gestiona el layout de paneles redimensionables (35% chat / 65% preview+editor).
+
+### Autenticación y persistencia
+
+Sesiones JWT via `jose` (expiración 7 días, basadas en cookies). Los usuarios registrados pueden guardar proyectos. Los usuarios anónimos tienen seguimiento basado en `localStorage` via `anon-work-tracker.ts`. El middleware en `src/middleware.ts` protege las rutas `/api/projects` y `/api/filesystem`. DB = SQLite via Prisma; el schema tiene `User` y `Project` (mensajes y sistema de archivos almacenados como strings JSON).
+
+## Schema de base de datos
+
+El schema completo está definido en `prisma/schema.prisma`. Consultarlo siempre que se necesite entender la estructura de los datos. Modelos clave:
+
+- `User` — id (cuid), email (único), password, timestamps
+- `Project` — id (cuid), name, userId (opcional, nullable para anónimos), messages (string JSON), data (string JSON con VirtualFileSystem), timestamps. Cascade delete al eliminar usuario.
+
+## Convenciones clave
+
+- El alias de path `@/*` apunta a `src/*`
+- Todos los componentes nuevos van bajo `src/components/<dominio>/`
+- Los componentes de shadcn/ui viven en `src/components/ui/` — no modificarlos manualmente
+- El system prompt de IA vive en `src/lib/prompts/generation.tsx` — Claude está instruido para siempre crear `/App.jsx` como punto de entrada y usar solo Tailwind para los estilos
+- `src/lib/provider.ts` exporta `getLanguageModel()` — el único lugar para cambiar el modelo de IA
+- Modelo en uso: `claude-haiku-4-5` (via `@ai-sdk/anthropic`)
